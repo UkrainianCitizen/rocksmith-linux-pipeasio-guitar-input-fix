@@ -1,31 +1,39 @@
 #!/usr/bin/env bash
 # Rocksmith 2014 on Linux — PipeASIO setup, one shot.
 #
-# Builds PipeASIO with 32-bit WoW64 support, installs it, copies it into the
-# Proton tree, registers it in the game prefix, installs RS_ASIO, and writes
-# both config files. Detects distro family, Steam library, game, prefix,
+# Builds PipeASIO with 32-bit WoW64 support, installs it to ~/.local, registers
+# it in the game prefix, installs RS_ASIO, and writes both config files. Proton
+# loads the driver via WINEDLLPATH, so nothing is copied into the Proton tree.
+# Detects distro family, Steam library, game, prefix,
 # Proton build, Wine lib root, and the guitar adapter.
 #
 #   ./rocksmith-pipeasio-setup.sh              full run
-#   ./rocksmith-pipeasio-setup.sh --reapply    just re-copy + re-register
-#                                              (after a Proton update)
-#   ./rocksmith-pipeasio-setup.sh --launch CMD reapply if stale, then exec CMD
-#                                              (for Steam launch options)
+#   ./rocksmith-pipeasio-setup.sh --reapply    no-op, kept for old habits
+#   ./rocksmith-pipeasio-setup.sh --launch CMD just exec CMD (old Steam launch
+#                                              options keep working)
 #   PROTON=/path/to/proton/files ./rocksmith-pipeasio-setup.sh
 #
 # Steam launch options must be set by hand — printed at the end.
 set -euo pipefail
 
 APPID=221680
-REAPPLY=0
-LAUNCH=0
-case "${1:-}" in
-  --reapply) REAPPLY=1 ;;
-  --launch)  REAPPLY=1; LAUNCH=1; shift ;;
-esac
 
 say() { printf '\n>> %s\n' "$*"; }
 die() { printf '\n!! %s\n' "$*" >&2; exit 1; }
+
+# Paths relative to the wine lib dir (~/.local/lib/wine after install).
+# tests/install-layout.sh reads this list.
+PIPEASIO_FILES=(
+  x86_64-unix/pipeasio32.so
+  x86_64-unix/pipeasio64.so
+  x86_64-windows/pipeasio64.dll
+  i386-windows/pipeasio32.dll
+)
+
+case "${1:-}" in
+  --reapply) say "--reapply is no longer needed: the driver lives in ~/.local and loads via WINEDLLPATH, so Proton updates don't affect it."; exit 0 ;;
+  --launch)  shift; exec "$@" ;;
+esac
 
 # ---------- distro family ----------
 FAMILY=""
@@ -62,20 +70,29 @@ PFX="$LIB/steamapps/compatdata/$APPID/pfx"
 [ -d "$PFX" ]  || die "Prefix missing — launch the game once from Steam, quit, rerun."
 say "game:   $GAME"
 
-# ---------- Proton: prefer newest GE (Valve builds ignore PROTON_USE_WOW64) ----------
+# ---------- Proton: prefer newest GE/CachyOS (the tested runners; Valve builds before 11.0-1 ignore PROTON_USE_WOW64) ----------
+newest() {  # stdin: Proton files dirs. Highest build timestamp in <parent>/version, else sort -V
+  local d t
+  while read -r d; do
+    t=$(awk '{print $1; exit}' "${d%/*}/version" 2>/dev/null || true)
+    case "$t" in ''|*[!0-9]*) t=0 ;; esac
+    printf '%s %s\n' "$t" "$d"
+  done | sort -k1,1n -k2V | tail -1 | cut -d' ' -f2-
+}
 if [ -z "${PROTON:-}" ]; then
   mapfile -t CAND < <( { ls -d "$STEAMROOT"/compatibilitytools.d/*/files 2>/dev/null
       for l in "${LIBS[@]}"; do
         ls -d "$l"/steamapps/common/Proton*/files "$l"/steamapps/common/Proton*/dist 2>/dev/null
       done; } | while read -r d; do [ -x "$d/bin/wine" ] && echo "$d"; done )
   [ "${#CAND[@]}" -gt 0 ] || die "No Proton found. Set PROTON=... and rerun."
-  GE=$(printf '%s\n' "${CAND[@]}" | grep -i -E 'GE-Proton|Proton-GE|CachyOS' | sort -V | tail -1 || true)
-  PROTON="${GE:-$(printf '%s\n' "${CAND[@]}" | sort -V | tail -1)}"
+  GE=$(printf '%s\n' "${CAND[@]}" | grep -i -E 'GE-Proton|Proton-GE|CachyOS' | newest || true)
+  PROTON="${GE:-$(printf '%s\n' "${CAND[@]}" | newest)}"
   [ -n "$GE" ] || cat <<'WARN'
 
    WARNING: no GE-Proton / Proton-CachyOS build found.
-   Valve's Proton silently ignores PROTON_USE_WOW64=1, which PipeASIO's
-   32-bit front end requires. Install GE-Proton 11.x (ProtonPlus) and rerun.
+   PipeASIO's 32-bit front end needs PROTON_USE_WOW64=1. Valve builds before
+   11.0-1 ignore it, and GE-Proton is the tested runner. Install GE-Proton 11.x
+   (ProtonPlus) and rerun.
 
 WARN
 fi
@@ -92,25 +109,22 @@ P_W32=$(find_dir "$PROTON" i386-windows)
 [ -n "$P_U64" ] && [ -n "$P_W64" ] && [ -n "$P_W32" ] \
   || die "Couldn't map Proton wine dll dirs under $PROTON"
 
-# ---------- re-apply shortcut ----------
-copy_into_proton() {  # returns 1 if the Proton tree was already current
-  local S="$HOME/.local/lib/wine" changed=0 rel dst
-  [ -f "$S/x86_64-unix/pipeasio32.so" ] || die "PipeASIO not installed yet — run without --reapply."
-  for rel in "x86_64-unix/pipeasio32.so:$P_U64" \
-             "x86_64-unix/pipeasio64.dll.so:$P_U64" \
-             "x86_64-windows/pipeasio64.dll:$P_W64" \
-             "i386-windows/pipeasio32.dll:$P_W32"; do
-    dst="${rel#*:}/$(basename "${rel%%:*}")"
-    cmp -s "$S/${rel%%:*}" "$dst" || { cp "$S/${rel%%:*}" "$dst"; changed=1; }
+# Proton's own lib/wine is searched before WINEDLLPATH, so old copies there would shadow the ~/.local build
+purge_proton_copies() {
+  local f d n=0
+  for d in "$P_U64" "$P_W64" "$P_W32"; do
+    for f in "${PIPEASIO_FILES[@]}" x86_64-unix/pipeasio64.dll.so; do
+      [ -e "$d/$(basename "$f")" ] && { rm -f "$d/$(basename "$f")"; n=$((n+1)); }
+    done
   done
-  [ "$changed" -eq 1 ] || return 1
-  say "copied PipeASIO into the Proton tree"
+  [ "$n" -eq 0 ] || say "removed $n stale PipeASIO file(s) from the Proton tree"
 }
 
 register_pipeasio() {
   say "registering in the game prefix (cancel any Wine Mono prompt)"
-  WINEPREFIX="$PFX" "$HOME/.local/bin/pipeasio-register" >/tmp/pipeasio-reg.log 2>&1 || true
-  WINEPREFIX="$PFX" wineserver -k >/dev/null 2>&1 || true
+  # Host wine would migrate the Proton prefix, so register with Proton's own wine
+  WINE="$PROTON/bin/wine" WINEPREFIX="$PFX" "$HOME/.local/bin/pipeasio-register" >/tmp/pipeasio-reg.log 2>&1 || true
+  WINEPREFIX="$PFX" "$PROTON/bin/wineserver" -k >/dev/null 2>&1 || true
   if grep -q "32-bit WoW64 front end registered" /tmp/pipeasio-reg.log; then
     say "registered (64-bit + 32-bit)"
   else
@@ -118,24 +132,15 @@ register_pipeasio() {
   fi
 }
 
-if [ "$REAPPLY" -eq 1 ]; then
-  # --launch must never stop the game starting, so failures here are advisory
-  if copy_into_proton; then
-    register_pipeasio
-    say "re-apply done."
-  else
-    say "Proton tree already current — nothing to do."
-  fi
-  [ "$LAUNCH" -eq 0 ] && exit 0
-  exec "$@"
-fi
-
 # ---------- dependencies ----------
 have_deps() {
   command -v cmake >/dev/null && command -v gcc >/dev/null && command -v unzip >/dev/null \
     && command -v winegcc >/dev/null && command -v winebuild >/dev/null \
     && pkg-config --exists libpipewire-0.3 \
-    && ls /usr/bin/i686-w64-mingw32-gcc >/dev/null 2>&1
+    && command -v i686-w64-mingw32-gcc >/dev/null \
+    && command -v i686-w64-mingw32-g++ >/dev/null \
+    && command -v x86_64-w64-mingw32-gcc >/dev/null \
+    && command -v x86_64-w64-mingw32-g++ >/dev/null
 }
 
 install_deps() {
@@ -145,13 +150,13 @@ install_deps() {
       [ -d /opt/wine-staging ] && wd="wine-staging-devel"
       [ -d /opt/wine-stable ]  && wd="wine-stable-devel"
       sudo dnf install -y --skip-unavailable cmake ninja-build gcc gcc-c++ pkgconf unzip \
-        pipewire-devel mingw32-gcc qt6-qtbase-devel "$wd" ;;
+        pipewire-devel mingw32-gcc mingw32-gcc-c++ mingw64-gcc mingw64-gcc-c++ "$wd" ;;
     arch)
       sudo pacman -S --needed --noconfirm cmake ninja gcc pkgconf unzip \
-        libpipewire mingw-w64-gcc qt6-base wine ;;
+        libpipewire mingw-w64-gcc wine ;;
     debian)
       sudo apt-get install -y cmake ninja-build gcc g++ pkg-config unzip \
-        libpipewire-0.3-dev gcc-mingw-w64-i686 qt6-base-dev wine64-tools libwine-dev ;;
+        libpipewire-0.3-dev gcc-mingw-w64-i686 g++-mingw-w64-i686 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wine64-tools libwine-dev ;;
     *) return 1 ;;
   esac
 }
@@ -161,7 +166,7 @@ if ! have_deps; then
   install_deps || true
 fi
 have_deps || die "Dependencies still missing: need cmake, gcc, unzip, winegcc/winebuild (Wine SDK),
-   libpipewire-0.3 dev headers, and an i686 MinGW cross-compiler. Install them and rerun."
+   libpipewire-0.3 dev headers, and i686 + x86_64 MinGW cross-compilers (gcc and g++). Install them and rerun."
 
 # ---------- Wine lib root (for the 32-bit import libs) ----------
 WLR=""
@@ -174,24 +179,30 @@ say "wine lib root: $WLR"
 
 # ---------- build PipeASIO ----------
 SRC=$(mktemp -d); trap 'rm -rf "$SRC"' EXIT
-say "cloning PipeASIO"
-git clone --depth 1 https://github.com/M0n7y5/pipeasio "$SRC/pipeasio" >/dev/null 2>&1
+# pinned to the latest release: upstream HEAD moves daily and renamed outputs before
+TAG=$(curl -fsSL https://api.github.com/repos/M0n7y5/pipeasio/releases/latest \
+  | grep -oP '"tag_name":\s*"\K[^"]+') || true
+[ -n "$TAG" ] || die "Could not resolve the latest PipeASIO release tag from the GitHub API (rate limit or network?)."
+say "cloning PipeASIO $TAG"
+git clone --depth 1 --branch "$TAG" https://github.com/M0n7y5/pipeasio "$SRC/pipeasio" >/dev/null 2>&1
 cd "$SRC/pipeasio"
 
 say "building (32-bit WoW64 enabled)"
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_WOW64_32=ON \
+      -DBUILD_SETTINGS_PANEL=OFF -DBUILD_MANAGER=OFF \
       -DWINE_LIB_ROOT="$WLR" >/dev/null
 cmake --build build -j"$(nproc)" >/dev/null
-[ -f build/pipeasio32.dll ] || ls build | grep -q pipeasio32 \
+[ -n "$(find build -name pipeasio32.dll -not -path '*/CMakeFiles/*' -print -quit)" ] \
   || die "32-bit front end was not built — check the cmake output."
 
 say "installing to \$HOME/.local"
 cmake --install build --prefix "$HOME/.local" >/dev/null
-[ -f "$HOME/.local/lib/wine/i386-windows/pipeasio32.dll" ] \
-  || die "pipeasio32.dll missing after install."
+for f in "${PIPEASIO_FILES[@]}"; do
+  [ -f "$HOME/.local/lib/wine/$f" ] || die "$f missing after install."
+done
 
 cd /
-copy_into_proton || true
+purge_proton_copies
 register_pipeasio
 
 # ---------- RS_ASIO (0.7.5+ required for Proton 11 / WoW64) ----------
@@ -223,7 +234,31 @@ BaseChannel=0
 Driver=PipeASIO
 Channel=0
 INI
-rm -f "$GAME/Rocksmith.ini"
+
+# RS_ASIO needs these two keys at 1. Edit in place so LatencyBuffer etc. survive reruns.
+# Missing keys go after LatencyBuffer/EnableMicrophone (the audio section). CRLF is kept.
+set_rs_ini() {
+  local f=$1 cr='' tmp
+  grep -q $'\r$' "$f" && cr=$'\r'
+  tmp=$(mktemp)
+  awk -v cr="$cr" '
+    { sub(/\r$/, ""); L[NR] = $0
+      if ($0 ~ /^ExclusiveMode[ \t]*=/) { L[NR] = "ExclusiveMode=1"; e = 1 }
+      else if ($0 ~ /^Win32UltraLowLatencyMode[ \t]*=/) { L[NR] = "Win32UltraLowLatencyMode=1"; w = 1 }
+      else if (!a && $0 ~ /^(LatencyBuffer|EnableMicrophone)[ \t]*=/) a = NR
+      else if (!h && $0 ~ /^\[Audio\]/) h = NR }
+    function add() { if (!e) print "ExclusiveMode=1" cr; if (!w) print "Win32UltraLowLatencyMode=1" cr }
+    END { if (!a) a = h
+      for (i = 1; i <= NR; i++) { print L[i] cr; if (i == a) add() }
+      if (!a && (!e || !w)) { print "[Audio]" cr; add() } }' "$f" > "$tmp" && cat "$tmp" > "$f"
+  rm -f "$tmp"
+}
+INI_NOTE=""
+if [ -f "$GAME/Rocksmith.ini" ]; then
+  set_rs_ini "$GAME/Rocksmith.ini"
+else
+  INI_NOTE="After the first launch, quit and rerun this script once so Rocksmith.ini gets ExclusiveMode=1 and Win32UltraLowLatencyMode=1 set."
+fi
 
 # ---------- PipeASIO config: detect the adapter, mono vs stereo ----------
 say "detecting guitar input"
@@ -263,7 +298,7 @@ Setup complete. One manual step left.
 In Steam: right-click Rocksmith > Properties > General >
 Launch Options, paste exactly this (one line):
 
-    PROTON_USE_WOW64=1 %command%
+    PROTON_USE_WOW64=1 WINEDLLPATH=$HOME/.local/lib/wine %command%
 
 And under Properties > Compatibility, force:
 
@@ -275,9 +310,10 @@ Then hit Play. Verify with:
 
 "bufferSwitch" lines mean audio is streaming.
 
-Tune inputs/device/latency with:  pipeasio-settings
-or edit ~/.config/pipeasio/config.ini (buffer_size) live.
-After a Proton update, rerun:  $0 --reapply
+Tune inputs/device/latency by editing ~/.config/pipeasio/config.ini
+(PipeASIO re-reads it live).
+${INI_NOTE:+$INI_NOTE
+}To get a newer PipeASIO later, rerun:  $0
 ============================================================
 
 EOM
