@@ -264,19 +264,20 @@ else
 fi
 
 # ---------- PipeASIO config: detect the adapter, mono vs stereo ----------
-say "detecting guitar input"
-NODE=$(pw-cli ls Node 2>/dev/null \
-  | grep -oP 'node\.name = "\K[^"]+' \
-  | grep -i -E 'guitar|rocksmith|real.?tone' | head -1 || true)
-NIN=1
-if [ -z "$NODE" ]; then
-  NODE=$(pw-cli ls Node 2>/dev/null | grep -oP 'node\.name = "\K[^"]+' \
-    | grep -i '^alsa_input' | grep -vi -E 'webcam|hdmi' | head -1 || true)
-fi
-case "$NODE" in *mono*) NIN=1 ;; *) [ -n "$NODE" ] && NIN=2 ;; esac
+CFG="$HOME/.config/pipeasio/config.ini"
+if [ -f "$CFG" ]; then
+  say "keeping your $CFG (delete it and rerun to detect the input again)"
+else
+  say "detecting guitar input"
+  # Only a Real Tone cable names itself. Anything else is left to the user, a guess fails silently.
+  NODE=$(pw-cli ls Node 2>/dev/null \
+    | grep -oP 'node\.name = "\K[^"]+' \
+    | grep -i -E 'guitar|rocksmith|real.?tone' | head -1 || true)
+  NIN=1
+  case "$NODE" in ''|*mono*) ;; *) NIN=2 ;; esac
 
-mkdir -p "$HOME/.config/pipeasio"
-cat > "$HOME/.config/pipeasio/config.ini" <<INI
+  mkdir -p "$HOME/.config/pipeasio"
+  cat > "$CFG" <<INI
 [pipeasio]
 sample_rate = 48000
 buffer_size = 256
@@ -285,11 +286,13 @@ outputs = 2
 input_device = $NODE
 INI
 
-if [ -n "$NODE" ]; then
-  say "input device: $NODE  (inputs = $NIN)"
-else
-  printf '   !! No input device detected. Plug the cable in, then set input_device in\n'
-  printf '      ~/.config/pipeasio/config.ini (find it with: pw-cli ls Node | grep node.name)\n'
+  if [ -n "$NODE" ]; then
+    say "input device: $NODE  (inputs = $NIN)"
+  else
+    printf '   !! No Real Tone cable found. input_device is empty, so PipeASIO uses your\n'
+    printf '      PipeWire default input. If that is not your guitar, set input_device in\n'
+    printf '      %s (find it with: pw-cli ls Node | grep node.name)\n' "$CFG"
+  fi
 fi
 
 # ---------- done ----------
