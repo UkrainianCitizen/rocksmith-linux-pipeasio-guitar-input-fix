@@ -149,6 +149,7 @@ install_deps() {
       local wd="wine-devel"
       [ -d /opt/wine-staging ] && wd="wine-staging-devel"
       [ -d /opt/wine-stable ]  && wd="wine-stable-devel"
+      # pkgconf has no pkg-config binary. pipewire-devel pulls in pkgconf-pkg-config, which does.
       sudo dnf install -y --skip-unavailable cmake ninja-build gcc gcc-c++ pkgconf unzip \
         pipewire-devel mingw32-gcc mingw32-gcc-c++ mingw64-gcc mingw64-gcc-c++ "$wd" ;;
     arch)
