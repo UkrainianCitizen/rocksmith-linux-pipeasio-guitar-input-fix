@@ -149,7 +149,6 @@ install_deps() {
       local wd="wine-devel"
       [ -d /opt/wine-staging ] && wd="wine-staging-devel"
       [ -d /opt/wine-stable ]  && wd="wine-stable-devel"
-      # pkgconf has no pkg-config binary. pipewire-devel pulls in pkgconf-pkg-config, which does.
       sudo dnf install -y --skip-unavailable cmake ninja-build gcc gcc-c++ pkgconf unzip \
         pipewire-devel mingw32-gcc mingw32-gcc-c++ mingw64-gcc mingw64-gcc-c++ "$wd" ;;
     arch)
@@ -214,10 +213,7 @@ RS_URL=$(curl -fsSL https://api.github.com/repos/mdias/rs_asio/releases/latest \
 RSTMP=$(mktemp -d)
 curl -fsSL "$RS_URL" -o "$RSTMP/rs.zip"
 unzip -oq "$RSTMP/rs.zip" -d "$RSTMP/x"
-# An empty find result would make dirname return ".", which is / here
-RSDLL=$(find "$RSTMP/x" -name RS_ASIO.dll | head -1)
-[ -n "$RSDLL" ] || { rm -rf "$RSTMP"; die "RS_ASIO.dll not found in $RS_URL"; }
-cp -rf "$(dirname "$RSDLL")"/. "$GAME"/
+cp -rf "$(dirname "$(find "$RSTMP/x" -name RS_ASIO.dll | head -1)")"/. "$GAME"/
 rm -rf "$RSTMP"
 
 cat > "$GAME/RS_ASIO.ini" <<'INI'
@@ -265,20 +261,19 @@ else
 fi
 
 # ---------- PipeASIO config: detect the adapter, mono vs stereo ----------
-CFG="$HOME/.config/pipeasio/config.ini"
-if [ -f "$CFG" ]; then
-  say "keeping your $CFG (delete it and rerun to detect the input again)"
-else
-  say "detecting guitar input"
-  # Only a Real Tone cable names itself. Anything else is left to the user, a guess fails silently.
-  NODE=$(pw-cli ls Node 2>/dev/null \
-    | grep -oP 'node\.name = "\K[^"]+' \
-    | grep -i -E 'guitar|rocksmith|real.?tone' | head -1 || true)
-  NIN=1
-  case "$NODE" in ''|*mono*) ;; *) NIN=2 ;; esac
+say "detecting guitar input"
+NODE=$(pw-cli ls Node 2>/dev/null \
+  | grep -oP 'node\.name = "\K[^"]+' \
+  | grep -i -E 'guitar|rocksmith|real.?tone' | head -1 || true)
+NIN=1
+if [ -z "$NODE" ]; then
+  NODE=$(pw-cli ls Node 2>/dev/null | grep -oP 'node\.name = "\K[^"]+' \
+    | grep -i '^alsa_input' | grep -vi -E 'webcam|hdmi' | head -1 || true)
+fi
+case "$NODE" in *mono*) NIN=1 ;; *) [ -n "$NODE" ] && NIN=2 ;; esac
 
-  mkdir -p "$HOME/.config/pipeasio"
-  cat > "$CFG" <<INI
+mkdir -p "$HOME/.config/pipeasio"
+cat > "$HOME/.config/pipeasio/config.ini" <<INI
 [pipeasio]
 sample_rate = 48000
 buffer_size = 256
@@ -287,13 +282,11 @@ outputs = 2
 input_device = $NODE
 INI
 
-  if [ -n "$NODE" ]; then
-    say "input device: $NODE  (inputs = $NIN)"
-  else
-    printf '   !! No Real Tone cable found. input_device is empty, so PipeASIO uses your\n'
-    printf '      PipeWire default input. If that is not your guitar, set input_device in\n'
-    printf '      %s (find it with: pw-cli ls Node | grep node.name)\n' "$CFG"
-  fi
+if [ -n "$NODE" ]; then
+  say "input device: $NODE  (inputs = $NIN)"
+else
+  printf '   !! No input device detected. Plug the cable in, then set input_device in\n'
+  printf '      ~/.config/pipeasio/config.ini (find it with: pw-cli ls Node | grep node.name)\n'
 fi
 
 # ---------- done ----------
