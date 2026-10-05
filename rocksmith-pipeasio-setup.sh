@@ -308,8 +308,10 @@ INI
   if [ -n "$NODE" ]; then
     say "input device: $NODE  (inputs = $NIN)"
   else
+    DEF=$(pactl get-default-source 2>/dev/null || true)
     printf '   !! No Real Tone cable found. input_device is empty, so PipeASIO uses your\n'
-    printf '      PipeWire default input. If that is not your guitar, set input_device in\n'
+    printf '      PipeWire default input, currently: %s\n' "${DEF:-unknown, check with: wpctl status}"
+    printf '      If that is not your guitar, set input_device in\n'
     printf '      %s (find it with: pw-cli ls Node | grep node.name)\n' "$CFG"
   fi
 fi
