@@ -213,7 +213,10 @@ RS_URL=$(curl -fsSL https://api.github.com/repos/mdias/rs_asio/releases/latest \
 RSTMP=$(mktemp -d)
 curl -fsSL "$RS_URL" -o "$RSTMP/rs.zip"
 unzip -oq "$RSTMP/rs.zip" -d "$RSTMP/x"
-cp -rf "$(dirname "$(find "$RSTMP/x" -name RS_ASIO.dll | head -1)")"/. "$GAME"/
+# An empty find result would make dirname return ".", which is / here
+RSDLL=$(find "$RSTMP/x" -name RS_ASIO.dll | head -1)
+[ -n "$RSDLL" ] || { rm -rf "$RSTMP"; die "RS_ASIO.dll not found in $RS_URL"; }
+cp -rf "$(dirname "$RSDLL")"/. "$GAME"/
 rm -rf "$RSTMP"
 
 cat > "$GAME/RS_ASIO.ini" <<'INI'
