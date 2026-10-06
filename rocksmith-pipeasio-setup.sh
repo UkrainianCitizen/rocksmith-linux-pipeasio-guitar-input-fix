@@ -17,6 +17,7 @@
 set -euo pipefail
 
 APPID=221680
+BUILDLOG=/tmp/pipeasio-build.log
 
 say() { printf '\n>> %s\n' "$*"; }
 die() { printf '\n!! %s\n' "$*" >&2; exit 1; }
@@ -133,10 +134,12 @@ register_pipeasio() {
 }
 
 # ---------- dependencies ----------
+# cmake wants libpipewire-0.3 >= 1.4.2 and stops hard below it.
 have_deps() {
   command -v cmake >/dev/null && command -v gcc >/dev/null && command -v unzip >/dev/null \
+    && command -v git >/dev/null && command -v curl >/dev/null \
     && command -v winegcc >/dev/null && command -v winebuild >/dev/null \
-    && pkg-config --exists libpipewire-0.3 \
+    && pkg-config --atleast-version=1.4.2 libpipewire-0.3 \
     && command -v i686-w64-mingw32-gcc >/dev/null \
     && command -v i686-w64-mingw32-g++ >/dev/null \
     && command -v x86_64-w64-mingw32-gcc >/dev/null \
@@ -151,13 +154,13 @@ install_deps() {
       [ -d /opt/wine-stable ]  && wd="wine-stable-devel"
       # pkgconf has no pkg-config binary. pipewire-devel pulls in pkgconf-pkg-config, which does.
       sudo dnf install -y --skip-unavailable cmake ninja-build gcc gcc-c++ pkgconf unzip \
-        pipewire-devel mingw32-gcc mingw32-gcc-c++ mingw64-gcc mingw64-gcc-c++ "$wd" ;;
+        git curl pipewire-devel mingw32-gcc mingw32-gcc-c++ mingw64-gcc mingw64-gcc-c++ "$wd" ;;
     arch)
       sudo pacman -S --needed --noconfirm cmake ninja gcc pkgconf unzip \
-        libpipewire mingw-w64-gcc wine ;;
+        git curl libpipewire mingw-w64-gcc wine ;;
     debian)
       sudo apt-get install -y cmake ninja-build gcc g++ pkg-config unzip \
-        libpipewire-0.3-dev gcc-mingw-w64-i686 g++-mingw-w64-i686 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wine64-tools libwine-dev ;;
+        git curl libpipewire-0.3-dev gcc-mingw-w64-i686 g++-mingw-w64-i686 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 wine64-tools libwine-dev ;;
     *) return 1 ;;
   esac
 }
@@ -166,16 +169,25 @@ if ! have_deps; then
   say "installing build dependencies (${FAMILY:-unknown distro})"
   install_deps || true
 fi
-have_deps || die "Dependencies still missing: need cmake, gcc, unzip, winegcc/winebuild (Wine SDK),
-   libpipewire-0.3 dev headers, and i686 + x86_64 MinGW cross-compilers (gcc and g++). Install them and rerun."
+have_deps || die "Dependencies still missing: need cmake, gcc, git, curl, unzip, winegcc/winebuild (Wine SDK),
+   libpipewire-0.3 >= 1.4.2 dev headers, and i686 + x86_64 MinGW cross-compilers (gcc and g++). Install them and rerun."
 
-# ---------- Wine lib root (for the 32-bit import libs) ----------
-WLR=""
-for c in $(find /usr/lib /usr/lib64 /usr/lib32 /opt -maxdepth 5 \
-             -path '*i386-windows/libwinecrt0.a' 2>/dev/null); do
-  WLR=$(dirname "$(dirname "$c")"); break
-done
-[ -n "$WLR" ] || die "Couldn't find i386-windows/libwinecrt0.a — install your Wine SDK's 32-bit part."
+# ---------- Wine lib root (holds the <arch>-windows import libs) ----------
+# cmake builds both front ends from one root, so it needs i386 and x86_64 import libs.
+# Arch keeps an i386-only tree in /usr/lib32/wine beside the full one in /usr/lib/wine.
+WLR="" WLR32=""
+while read -r c; do
+  r=$(dirname "$(dirname "$c")")
+  [ -n "$WLR32" ] || WLR32="$r"
+  [ -f "$r/x86_64-windows/libwinecrt0.a" ] || continue
+  WLR="$r"; break
+done < <(find /usr/lib /usr/lib64 /usr/lib32 /opt -maxdepth 5 \
+           -path '*/i386-windows/libwinecrt0.a' 2>/dev/null | sort)
+[ -n "$WLR32" ] || die "Couldn't find i386-windows/libwinecrt0.a — install your Wine SDK's 32-bit part."
+if [ -z "$WLR" ]; then
+  WLR="$WLR32"
+  printf '   !! %s has no x86_64-windows import libraries, cmake may refuse it.\n' "$WLR"
+fi
 say "wine lib root: $WLR"
 
 # ---------- build PipeASIO ----------
@@ -184,20 +196,26 @@ SRC=$(mktemp -d); trap 'rm -rf "$SRC"' EXIT
 TAG=$(curl -fsSL https://api.github.com/repos/M0n7y5/pipeasio/releases/latest \
   | grep -oP '"tag_name":\s*"\K[^"]+') || true
 [ -n "$TAG" ] || die "Could not resolve the latest PipeASIO release tag from the GitHub API (rate limit or network?)."
-say "cloning PipeASIO $TAG"
-git clone --depth 1 --branch "$TAG" https://github.com/M0n7y5/pipeasio "$SRC/pipeasio" >/dev/null 2>&1
+: > "$BUILDLOG"
+say "cloning PipeASIO $TAG  (build log: $BUILDLOG)"
+git clone --depth 1 --branch "$TAG" https://github.com/M0n7y5/pipeasio "$SRC/pipeasio" >>"$BUILDLOG" 2>&1 \
+  || die "git clone failed — see $BUILDLOG"
 cd "$SRC/pipeasio"
 
+# BUILD_TESTS=OFF: the test hosts are never installed and only add ways for the build to fail.
 say "building (32-bit WoW64 enabled)"
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_WOW64_32=ON \
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_WOW64_32=ON -DBUILD_TESTS=OFF \
       -DBUILD_SETTINGS_PANEL=OFF -DBUILD_MANAGER=OFF \
-      -DWINE_LIB_ROOT="$WLR" >/dev/null
-cmake --build build -j"$(nproc)" >/dev/null
+      -DWINE_LIB_ROOT="$WLR" >>"$BUILDLOG" 2>&1 \
+  || die "cmake configure failed — see $BUILDLOG"
+cmake --build build -j"$(nproc)" >>"$BUILDLOG" 2>&1 \
+  || die "cmake build failed — see $BUILDLOG"
 [ -n "$(find build -name pipeasio32.dll -not -path '*/CMakeFiles/*' -print -quit)" ] \
-  || die "32-bit front end was not built — check the cmake output."
+  || die "32-bit front end was not built — see $BUILDLOG"
 
 say "installing to \$HOME/.local"
-cmake --install build --prefix "$HOME/.local" >/dev/null
+cmake --install build --prefix "$HOME/.local" >>"$BUILDLOG" 2>&1 \
+  || die "cmake install failed — see $BUILDLOG"
 for f in "${PIPEASIO_FILES[@]}"; do
   [ -f "$HOME/.local/lib/wine/$f" ] || die "$f missing after install."
 done
@@ -290,8 +308,10 @@ INI
   if [ -n "$NODE" ]; then
     say "input device: $NODE  (inputs = $NIN)"
   else
+    DEF=$(pactl get-default-source 2>/dev/null || true)
     printf '   !! No Real Tone cable found. input_device is empty, so PipeASIO uses your\n'
-    printf '      PipeWire default input. If that is not your guitar, set input_device in\n'
+    printf '      PipeWire default input, currently: %s\n' "${DEF:-unknown, check with: wpctl status}"
+    printf '      If that is not your guitar, set input_device in\n'
     printf '      %s (find it with: pw-cli ls Node | grep node.name)\n' "$CFG"
   fi
 fi
